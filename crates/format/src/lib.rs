@@ -3,7 +3,9 @@
 //! - `mimetype` (stored first, uncompressed): `application/vnd.designcraft+zip`
 //! - `document.json`: the [`Document`] (pretty JSON, documented by the serde model in `designcraft-doc`)
 //! - `assets/<id>.<ext>`: embedded placed files, byte-for-byte: one per distinct file, and only
-//!   the ones the document references (see [`Document::compact_assets`])
+//!   the ones the document references (see [`Document::compact_assets`]). A save can instead
+//!   leave out the files that are linked to disk ([`Placed::LinksOnly`]): recovery data does,
+//!   so that it is not a copy of the user's Links folder
 //! - `meta.json`: format version and generator
 //! - `preview.png` (optional): a small picture of the first page, for the start screen's recent files
 //!
@@ -66,6 +68,37 @@ pub fn save_with_preview(doc: &Document, preview: Option<&[u8]>) -> Result<Vec<u
     save_with_large_entries_from(doc, preview, LARGE_ENTRY)
 }
 
+/// [`save`], leaving out the placed files that are linked to a file on disk (see
+/// [`Placed::LinksOnly`]): the package holds their paths, and opening it reads them again.
+pub fn save_links_only(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    let mut buf = Cursor::new(Vec::new());
+    write_with(&mut buf, doc, None, Placed::LinksOnly)?;
+    Ok(buf.into_inner())
+}
+
+/// Write the package to `out` instead of returning it in memory: a document with gigabytes of
+/// placed files needs no second copy in RAM (recovery snapshots, large saves).
+pub fn write<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>) -> Result<(), FormatError> {
+    write_with(out, doc, preview, Placed::Embed)
+}
+
+/// What a save does with placed files that are linked to a file on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placed {
+    /// Every placed file goes into the package, byte for byte: a self-contained document.
+    #[default]
+    Embed,
+    /// Linked files are left out and only their paths stay: for data that is not a copy of the
+    /// user's disk (crash recovery), where re-reading a link is what opening the document does.
+    /// Files pasted into the document are still embedded — nothing else holds them.
+    LinksOnly,
+}
+
+/// [`write`], choosing what happens to linked placed files.
+pub fn write_with<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>, placed: Placed) -> Result<(), FormatError> {
+    write_with_large_entries_from(out, doc, preview, placed, LARGE_ENTRY)
+}
+
 /// Asset entries this size or larger are written with zip64 sizes. Zip rejects an entry over
 /// 4 GiB written without them; the margin covers deflate output that is larger than its input.
 const LARGE_ENTRY: usize = (u32::MAX as usize).saturating_sub(64 << 20);
@@ -86,6 +119,18 @@ fn required_version(doc: &Document) -> u32 {
 }
 
 fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_entry: usize) -> Result<Vec<u8>, FormatError> {
+    let mut buf = Cursor::new(Vec::new());
+    write_with_large_entries_from(&mut buf, doc, preview, Placed::Embed, large_entry)?;
+    Ok(buf.into_inner())
+}
+
+fn write_with_large_entries_from<W: Write + std::io::Seek>(
+    out: &mut W,
+    doc: &Document,
+    preview: Option<&[u8]>,
+    placed: Placed,
+    large_entry: usize,
+) -> Result<(), FormatError> {
     // JSON writes infinity and NaN as null, which no load accepts: the file would not open.
     if let Some(id) = doc.non_finite_item() {
         return Err(FormatError::Unsaveable(format!("object {} has a position or size that is not a finite number", id.0)));
@@ -94,9 +139,8 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
     compact.compact_assets();
     let doc = &compact;
     let io = |e: zip::result::ZipError| FormatError::Io(e.to_string());
-    let mut buf = Cursor::new(Vec::new());
     {
-        let mut z = zip::ZipWriter::new(&mut buf);
+        let mut z = zip::ZipWriter::new(out);
         let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let deflate = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         z.start_file("mimetype", stored).map_err(io)?;
@@ -113,7 +157,7 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
         let json = serde_json::to_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
         z.write_all(&json).map_err(|e| FormatError::Io(e.to_string()))?;
         for (id, a) in &doc.assets {
-            if a.data.is_empty() {
+            if a.data.is_empty() || (placed == Placed::LinksOnly && a.link.is_some()) {
                 continue;
             }
             // Already-compressed images are stored as-is.
@@ -124,7 +168,7 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
         }
         z.finish().map_err(io)?;
     }
-    Ok(buf.into_inner())
+    Ok(())
 }
 
 /// The file name extension of a DesignCraft document.

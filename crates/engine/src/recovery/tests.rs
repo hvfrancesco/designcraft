@@ -126,6 +126,96 @@ fn recovery_data_is_private_to_the_user() {
     }
 }
 
+/// Poll `file.recovery.progress` until the background writer has nothing left, as the app does at
+/// the end of a frame.
+fn finished_writes(s: &mut Session) -> usize {
+    let mut written = 0;
+    for _ in 0..1200 {
+        let v = s.execute("file.recovery.progress", &json!({})).unwrap();
+        assert_eq!(v["errors"], json!([]), "{v}");
+        written += v["written"].as_u64().unwrap_or(0) as usize;
+        if !v["busy"].as_bool().unwrap_or(false) {
+            return written;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the background writer did not finish");
+}
+
+#[test]
+fn a_background_save_writes_recovery_data_the_app_can_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = dirty_session();
+    s.recovery_dir = Some(dir.path().to_path_buf());
+    // The timer's call: the interface thread does not wait for the deflate or the file writes.
+    let queued = s.execute("file.recovery.save", &json!({"background": true})).unwrap();
+    assert_eq!(queued["queued"], 1, "{queued}");
+    assert_eq!(finished_writes(&mut s), 1);
+    assert_eq!(list(dir.path()).len(), 1);
+    assert!(s.docs[0].recovery_entries.iter().any(|(d, _)| same_directory(d, dir.path())), "the checkpoint is recorded");
+    // Recovering it gives the unsaved edits back.
+    let mut reopened = Session::new();
+    assert_eq!(open(&mut reopened, dir.path()).unwrap().len(), 1);
+    assert_eq!(reopened.doc().unwrap().doc.spreads[0].items.len(), 1);
+    assert!(reopened.doc().unwrap().is_dirty());
+    discard(dir.path(), reopened.doc().unwrap().uid);
+}
+
+/// A placed file linked to disk, as a catalogues with a Links folder has them.
+fn session_with_linked_image(dir: &Path) -> (Session, std::path::PathBuf) {
+    let image = dir.join("photo.png");
+    let png = designcraft_render::Rendered { width: 8, height: 8, pixels: vec![90u8; 8 * 8 * 4] }.to_png();
+    std::fs::write(&image, &png).unwrap();
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    s.execute("file.place", &json!({"path": image.to_string_lossy()})).unwrap();
+    assert!(s.doc().unwrap().doc.assets.values().any(|a| a.link.is_some()), "the file is placed as a link");
+    (s, image)
+}
+
+#[test]
+fn recovery_data_keeps_a_linked_file_as_a_link() {
+    // Embedding the linked file made a recovery snapshot as large as the user's Links folder,
+    // and left those gigabytes behind after every crash.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, image) = session_with_linked_image(dir.path());
+    let entry = dir.path().join(format!("{}.designcraft", s.docs[0].uid));
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    let bytes = std::fs::read(&entry).unwrap();
+    let packaged = designcraft_format::load(&bytes).unwrap();
+    assert!(packaged.assets.values().all(|a| a.data.is_empty()), "the snapshot carries no copy of the link");
+    assert!(packaged.assets.values().all(|a| a.link.is_some()), "it keeps where the file is");
+    // Recovering reads it back: the document opens as it did.
+    let mut reopened = Session::new();
+    assert_eq!(open(&mut reopened, dir.path()).unwrap().len(), 1);
+    let a = reopened.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(a.link.as_deref(), Some(image.to_string_lossy().as_ref()));
+    assert_eq!(&*a.data, &std::fs::read(&image).unwrap());
+    discard(dir.path(), reopened.doc().unwrap().uid);
+    // A link that is gone after the crash is a missing link, not a failed recovery.
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    std::fs::remove_file(&image).unwrap();
+    let mut recovered = Session::new();
+    assert_eq!(open(&mut recovered, dir.path()).unwrap().len(), 1);
+    let a = recovered.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert!(a.data.is_empty());
+    discard(dir.path(), recovered.doc().unwrap().uid);
+}
+
+#[test]
+fn a_saved_document_is_not_written_in_the_background() {
+    // The autosave writes unsaved documents only.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = dirty_session();
+    s.recovery_dir = Some(dir.path().to_path_buf());
+    let saved = dir.path().join("saved.designcraft");
+    s.execute("file.saveAs", &json!({"path": saved.to_string_lossy()})).unwrap();
+    let queued = s.execute("file.recovery.save", &json!({"background": true})).unwrap();
+    assert_eq!(queued["queued"], 0, "{queued}");
+    assert_eq!(finished_writes(&mut s), 0);
+    assert!(list(dir.path()).is_empty());
+}
+
 #[test]
 fn existing_recovery_directory_is_used() {
     let root = tempfile::tempdir().unwrap();
