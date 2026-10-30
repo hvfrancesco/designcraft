@@ -718,12 +718,27 @@ pub fn finish(outcome: Result<eframe::Result, String>, startup: &Startup) -> Res
         if graphics_failed && startup.adapter.get().is_none() && startup.blamed_a_backend() && !startup.skip.iter().any(|k| k == RETRIED) {
             log::error!("the window failed ({why}): no graphics adapter could show it; forgetting the recorded failures and starting again");
             startup.forget_failures();
-            return restart(&[RETRIED.to_string()], startup).map_err(|e| format!("{why}; starting again failed: {e}"));
+            return restart(&retry_skip(&startup.skip), startup).map_err(|e| format!("{why}; starting again failed: {e}"));
         }
         return Err(if graphics_failed { format!("{why} ({HELP})") } else { why });
     };
     log::error!("the window failed ({why}): starting again {what}");
     restart(&skip, startup).map_err(|e| format!("{why}; starting again failed: {e}"))
+}
+
+/// The skip list of the start after one that found no graphics adapter at all: the adapters
+/// earlier restarts left out stay out (nothing recorded says they recovered), while the backend
+/// exclusions go, since dropping those is what this retry is for.
+fn retry_skip(skip: &[String]) -> Vec<String> {
+    let mut retry: Vec<String> = skip.iter().filter(|k| leaves_out_an_adapter(k)).cloned().collect();
+    retry.push(RETRIED.to_string());
+    retry
+}
+
+/// Whether a skip key names one adapter (`Dx12:10de:2204`, `Metal:Intel Iris Pro Graphics`)
+/// rather than a whole backend's [`backend::Backend::key`] or one of this module's markers.
+fn leaves_out_an_adapter(key: &str) -> bool {
+    !matches!(key, SOFTWARE | SOFTWARE_LEFT | RETRIED) && backend::Backend::from_key(key).is_none()
 }
 
 /// The skip list to start again with after the graphics failed while the window was starting up,

@@ -192,14 +192,85 @@ fn recovery_data_keeps_a_linked_file_as_a_link() {
     assert_eq!(a.link.as_deref(), Some(image.to_string_lossy().as_ref()));
     assert_eq!(&*a.data, &std::fs::read(&image).unwrap());
     discard(dir.path(), reopened.doc().unwrap().uid);
-    // A link that is gone after the crash is a missing link, not a failed recovery.
+}
+
+/// The placed bytes of the linked image in `dir`.
+fn placed_bytes(s: &Session) -> Vec<u8> {
+    s.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link").data.to_vec()
+}
+
+#[test]
+fn a_link_whose_file_changed_or_is_gone_keeps_its_bytes() {
+    // A snapshot leaves a link out only while the file still holds the placed bytes: a file that
+    // was moved, edited or deleted after placement must not replace what the user saw.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, image) = session_with_linked_image(dir.path());
+    let placed = placed_bytes(&s);
+    let entry = dir.path().join(format!("{}.designcraft", s.docs[0].uid));
+
+    // Edited in place, to another size.
+    std::fs::write(&image, b"not the placed bytes any more").unwrap();
     assert_eq!(save(&s, dir.path()).unwrap(), 1);
-    std::fs::remove_file(&image).unwrap();
+    let packaged = designcraft_format::load(&std::fs::read(&entry).unwrap()).unwrap();
+    let a = packaged.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(placed, a.data.to_vec(), "the bytes the file no longer holds stay in the snapshot");
+    assert_eq!(a.link.as_deref(), Some(image.to_string_lossy().as_ref()), "and so does the link");
     let mut recovered = Session::new();
     assert_eq!(open(&mut recovered, dir.path()).unwrap().len(), 1);
     let a = recovered.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
-    assert!(a.data.is_empty());
+    assert_eq!(placed, a.data.to_vec(), "recovered as the user saw it, not as the edited file is");
+    // The republished entry (a crash before the next timer) keeps them too.
+    let (uid, _) = list(dir.path()).into_iter().next().expect("the recovered entry");
+    let republished = designcraft_format::load(&std::fs::read(files(dir.path(), uid).0).unwrap()).unwrap();
+    assert!(republished.assets.values().any(|a| !a.data.is_empty()), "the republished snapshot keeps them");
     discard(dir.path(), recovered.doc().unwrap().uid);
+
+    // Gone after the crash: the bytes stay, and the link reports missing, as opening would.
+    std::fs::remove_file(&image).unwrap();
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    let mut recovered = Session::new();
+    assert_eq!(open(&mut recovered, dir.path()).unwrap().len(), 1);
+    let a = recovered.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(placed, a.data.to_vec());
+    let links = recovered.execute("links.list", &json!({})).unwrap();
+    assert_eq!(links[0]["status"], "missing", "the file is still reported missing, as opening reports it");
+    discard(dir.path(), recovered.doc().unwrap().uid);
+}
+
+#[test]
+fn a_snapshot_that_finishes_after_the_save_is_dropped() {
+    // A write of a large document runs for seconds: the user can save while it does. The saved
+    // document's checkpoint is consumed then, and the write must not put a stale snapshot back.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = dirty_session();
+    s.recovery_dir = Some(dir.path().to_path_buf());
+    let uid = s.docs[0].uid;
+    // The snapshot the writer took before the save.
+    let entry = Snapshot::of(&prepare_save(&s, dir.path()).unwrap(), dir.path(), &s.docs[0]);
+    let saved = dir.path().join("saved.designcraft");
+    s.execute("file.saveAs", &json!({"path": saved.to_string_lossy()})).unwrap();
+    assert!(!s.docs[0].is_dirty());
+    // The write lands after the save.
+    write_snapshot(&entry).unwrap();
+    let (file, _) = files(dir.path(), uid);
+    assert!(file.exists());
+    assert!(!record_checkpoint(&mut s, dir.path().to_path_buf(), uid), "a saved document records no checkpoint");
+    assert!(!file.exists(), "its snapshot is not left to be recovered");
+    assert!(list(dir.path()).is_empty());
+    // A document still unsaved does record one.
+    s.execute("frame.create", &json!({"rect": [10, 10, 50, 50]})).unwrap();
+    let entry = Snapshot::of(&prepare_save(&s, dir.path()).unwrap(), dir.path(), &s.docs[0]);
+    write_snapshot(&entry).unwrap();
+    assert!(record_checkpoint(&mut s, dir.path().to_path_buf(), uid));
+    assert!(s.docs[0].recovery_entries.iter().any(|(d, u)| *u == uid && d == dir.path()));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_panicking_recovery_write_is_an_error_and_the_writer_keeps_going() {
+    let err = worker::guarded(|| -> Result<()> { panic!("boom") }).unwrap_err();
+    assert!(err.to_string().contains("panicked") && err.to_string().contains("boom"), "{err}");
+    assert_eq!(worker::guarded(|| Ok(7)).unwrap(), 7, "the next write still runs");
 }
 
 #[test]

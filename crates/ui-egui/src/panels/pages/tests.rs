@@ -7,6 +7,16 @@ use egui_kittest::{
 use super::*;
 use crate::test_window;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_panicking_thumbnail_leaves_its_row_undrawn_and_the_worker_alive() {
+    // A renderer bug on one document must not end the thread: its slot would stay reserved, and
+    // four of them would stop the panel from drawing any thumbnail again.
+    let (drawn, panicked) = super::worker::contained(|| -> Option<u32> { panic!("a renderer bug") });
+    assert!(drawn.is_none() && panicked);
+    assert_eq!(super::worker::contained(|| Some(7)), (Some(7), false), "the next row draws");
+}
+
 #[test]
 fn parent_context_menu_deletes_the_clicked_id_even_with_a_shared_prefix() {
     for vertical in [true, false] {

@@ -555,20 +555,28 @@ mod tests {
 
     #[test]
     fn a_backend_that_could_not_find_an_adapter_is_not_blamed_by_the_next_start() {
-        // A start on Vulkan whose process was killed before its first frame leaves the record
-        // blaming Vulkan; the next start moves to OpenGL, which has no adapter that can show the
-        // window here. Forgetting the record must let Vulkan be chosen again, or the app would
-        // never start (gpu::finish restarts with the recorded failures forgotten).
+        // A start on this platform's first candidate whose process was killed before its first
+        // frame leaves the record blaming it; the next start moves to another backend, which has
+        // no adapter that can show the window here. Forgetting the record must let the first
+        // candidate be chosen again, or the app would never start (gpu::finish restarts with the
+        // recorded failures forgotten). That first candidate is DirectX 12 on Windows, Metal on
+        // macOS and Vulkan elsewhere.
+        let first = candidates()[0];
+        assert_ne!(first, Backend::Gl, "OpenGL is a fallback, not a first candidate");
         let path = temp_path("forget");
-        write(&path, &record(Some(Backend::Vulkan), &[])).expect("write");
+        write(&path, &record(Some(first), &[])).expect("write");
         let mut s = Fallback::begin_unforced(Some(path.clone()), V, &[]).expect("candidates");
-        assert_ne!(s.backend, Backend::Vulkan, "the unfinished start moved away from Vulkan");
-        assert!(s.blamed_a_backend(), "the start moved away from the backend it blamed");
+        // macOS has only Metal: there is nowhere to move, so the record is cleared and it is
+        // chosen again at once.
+        if candidates().len() > 1 {
+            assert_ne!(s.backend, first, "the unfinished start moved away from {first:?}");
+            assert!(s.blamed_a_backend(), "the start moved away from the backend it blamed");
+        }
         s.forget();
         assert_eq!(read(&path), record(None, &[]), "nothing is blamed any more");
         assert!(!s.blamed_a_backend());
         let s = Fallback::begin_unforced(Some(path.clone()), V, &[]).expect("candidates");
-        assert_eq!(s.backend, Backend::Vulkan, "the unproven failure is gone");
+        assert_eq!(s.backend, first, "the unproven failure is gone");
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 

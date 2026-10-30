@@ -611,9 +611,13 @@ fn write_snapshot(entry: &Snapshot) -> Result<()> {
     let (doc, meta) = files(&entry.dir, entry.uid);
     // Links stay links: recovery data is not a copy of the user's disk, and a catalogue with
     // gigabytes of placed files otherwise writes them all again every few minutes (and leaves
-    // them behind after a crash). Recovery re-reads them, as opening the document does.
+    // them behind after a crash). Recovery re-reads them, as opening the document does — except
+    // the ones whose file no longer holds the placed bytes, which stay in the snapshot.
+    let document = entry.path.as_deref().map(Path::new);
+    let keep = links_that_need_bytes(&entry.doc, document);
     publish_recovery_written(&doc, entry.own, |out| {
-        designcraft_format::write_with(out, &entry.doc, None, designcraft_format::Placed::LinksOnly).map_err(|e| EngineError::Other(e.to_string()))
+        designcraft_format::write_with(out, &entry.doc, None, designcraft_format::Placed::LinksOnlyExcept(&keep))
+            .map_err(|e| EngineError::Other(e.to_string()))
     })?;
     // Written: in a folder that is not this run's own, the entry is now this run's to replace and
     // remove (Save and Close must clean up the snapshot they wrote).
@@ -668,8 +672,52 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
     }
 }
 
-/// Apply finished background writes: record the checkpoint of each document still open, and drop
-/// the entry of one closed while it was being written. Returns what was written and what failed.
+/// The linked assets a recovery snapshot must keep the bytes of: those whose file no longer
+/// reproduces them (gone, or another size). Metadata only: re-reading every link would cost what
+/// leaving them out saves, and opening the snapshot reads the unchanged ones anyway. A file
+/// edited in place to the same size is still taken from the disk, as opening the document takes it.
+fn links_that_need_bytes(doc: &designcraft_doc::Document, document: Option<&Path>) -> Vec<designcraft_doc::AssetId> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (doc, document);
+        Vec::new()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        doc.assets.values().filter(|a| !a.data.is_empty() && a.link.is_some()).filter(|a| !link_reproduces(a, document)).map(|a| a.id).collect()
+    }
+}
+
+/// Whether the file `a` is linked to still holds the bytes placed into the document.
+#[cfg(not(target_arch = "wasm32"))]
+fn link_reproduces(a: &designcraft_doc::Asset, document: Option<&Path>) -> bool {
+    let Some(link) = a.link.as_deref() else { return true };
+    let Ok(path) = crate::io::document_path(link, document) else { return false };
+    crate::io::metadata(path).is_ok_and(|m| m.is_file() && u64::try_from(a.data.len()).is_ok_and(|n| m.len() == n))
+}
+
+/// Apply one finished background write: record the checkpoint of a document still open and
+/// unsaved, or drop the snapshot of one saved, reverted or closed while its write ran. Returns
+/// whether a checkpoint was recorded.
+fn record_checkpoint(s: &mut Session, dir: PathBuf, uid: u64) -> bool {
+    match s.docs.iter_mut().find(|doc| doc.uid == uid) {
+        Some(doc) if doc.is_dirty() => {
+            if !has_checkpoint(doc, &dir) {
+                doc.recovery_entries.push((dir, uid));
+            }
+            true
+        }
+        // Saved, reverted or closed while being written: its snapshot must not come back after a
+        // crash, and the timer writes only when a document is dirty, so nothing else would
+        // remove it.
+        Some(_) | None => {
+            discard(&dir, uid);
+            false
+        }
+    }
+}
+
+/// Apply finished background writes. Returns what was written and what failed.
 pub(crate) struct Finished {
     pub written: usize,
     pub errors: Vec<String>,
@@ -680,25 +728,22 @@ pub(crate) struct Finished {
 pub(crate) fn finished(s: &mut Session) -> Finished {
     let mut out = Finished { written: 0, errors: Vec::new(), busy: false };
     let Some(w) = worker::started() else { return out };
-    out.busy = w.busy();
-    let Ok(done) = w.done.lock() else { return out };
+    let Ok(done) = w.done.lock() else {
+        out.busy = w.busy();
+        return out;
+    };
     while let Ok(d) = done.try_recv() {
         if let Some(e) = d.error {
             out.errors.push(e);
             continue;
         }
-        match s.docs.iter_mut().find(|doc| doc.uid == d.uid) {
-            Some(doc) => {
-                if !has_checkpoint(doc, &d.dir) {
-                    doc.recovery_entries.push((d.dir, d.uid));
-                }
-                out.written += 1;
-            }
-            // Closed while being written: its snapshot must not come back after a crash.
-            None => discard(&d.dir, d.uid),
+        if record_checkpoint(s, d.dir, d.uid) {
+            out.written += 1;
         }
     }
-    out.busy |= w.busy();
+    // After draining: the worker delivers a result before it clears the document as running, so
+    // "not busy" means every result is already in the channel, not on its way.
+    out.busy = w.busy();
     out
 }
 
@@ -716,7 +761,7 @@ mod worker {
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
 
-    use super::{Path, PathBuf, Snapshot, write_snapshot};
+    use super::{Path, PathBuf, Result, Snapshot, write_snapshot};
 
     /// One document written, for the interface thread to record.
     pub(super) struct Done {
@@ -754,13 +799,16 @@ mod worker {
                 let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
                 let spawned = std::thread::Builder::new().name("designcraft-recovery".into()).spawn(move || {
                     while let Ok(job) = job_rx.recv() {
-                        let error = write_snapshot(&job).err().map(|e| e.to_string());
+                        let error = guarded_write(&job);
                         let (dir, uid) = (job.dir, job.uid);
-                        // Before the result is visible: a writer already done is not busy.
+                        // The result before the document reads as idle: a writer that is not busy
+                        // has already delivered it, so the interface never stops polling with an
+                        // answer still on its way.
+                        let sent = done_tx.send(Done { dir: dir.clone(), uid, error }).is_ok();
                         if let Some(w) = WRITER.get().and_then(Option::as_ref) {
                             w.finish(&dir, uid);
                         }
-                        if done_tx.send(Done { dir, uid, error }).is_err() {
+                        if !sent {
                             break;
                         }
                     }
@@ -773,6 +821,20 @@ mod worker {
     /// The writer if it has been started.
     pub(super) fn started() -> Option<&'static Writer> {
         WRITER.get().and_then(Option::as_ref)
+    }
+
+    /// Write one snapshot, turning a panic into its error: a panic that ended this thread would
+    /// leave the document marked as running for ever (so it is never written again) and the
+    /// interface asking for frames for ever. A safety net: a writer still must not panic.
+    fn guarded_write(job: &Snapshot) -> Option<String> {
+        guarded(|| write_snapshot(job)).err().map(|e| e.to_string())
+    }
+
+    /// [`guarded_write`]'s guard, for any write on this thread.
+    pub(super) fn guarded<T>(write: impl FnOnce() -> Result<T>) -> Result<T> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).unwrap_or_else(|payload| {
+            Err(crate::EngineError::Other(format!("recovery writer panicked: {}", crate::guard::panic_message(payload.as_ref()))))
+        })
     }
 
     /// Queue a document's write. `None`: no writer thread (the caller writes it itself);
@@ -998,8 +1060,9 @@ pub fn list(dir: &Path) -> Vec<(u64, Value)> {
 }
 
 /// Read back the placed files a recovery snapshot left out because they are linked, as opening
-/// the document does. A link whose file is gone stays a missing link, and the document opens the
-/// same way the original would: recovery data is not a second copy of the user's disk.
+/// the document does. A link whose file is gone or changed kept its bytes in the snapshot (see
+/// [`links_that_need_bytes`]), so what the user saw survives the crash; an unchanged one is read
+/// here, as opening the document reads it.
 #[cfg(not(target_arch = "wasm32"))]
 fn reload_links(d: &mut designcraft_doc::Document, document: Option<&Path>) {
     for a in d.assets.values_mut() {
@@ -1077,8 +1140,10 @@ fn open_with_publisher(s: &mut Session, dir: &Path, mut publish: impl FnMut(&Pat
         // clean up every snapshot this document actually owns rather than an unrelated same uid.
         if let Some(state) = s.docs.get_mut(index) {
             let (document, metadata) = files(&destination, state.uid);
-            // Still recovery data: the republished copy keeps links as links too.
-            let published = designcraft_format::save_links_only(state.doc.as_ref())
+            // Still recovery data: the republished copy keeps links as links too, except the ones
+            // whose file no longer holds their bytes, which must survive the republish.
+            let keep = links_that_need_bytes(state.doc.as_ref(), state.path.as_deref().map(Path::new));
+            let published = designcraft_format::save_links_only_except(state.doc.as_ref(), &keep)
                 .map_err(|e| EngineError::Other(e.to_string()))
                 .and_then(|bytes| publish(&document, &bytes));
             match published {

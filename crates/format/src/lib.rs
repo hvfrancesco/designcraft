@@ -76,6 +76,15 @@ pub fn save_links_only(doc: &Document) -> Result<Vec<u8>, FormatError> {
     Ok(buf.into_inner())
 }
 
+/// [`save_links_only`], keeping the bytes of the linked assets in `keep` (see
+/// [`Placed::LinksOnlyExcept`]): a link whose file no longer reproduces its placed bytes must not
+/// replace them when the package is opened.
+pub fn save_links_only_except(doc: &Document, keep: &[AssetId]) -> Result<Vec<u8>, FormatError> {
+    let mut buf = Cursor::new(Vec::new());
+    write_with(&mut buf, doc, None, Placed::LinksOnlyExcept(keep))?;
+    Ok(buf.into_inner())
+}
+
 /// Write the package to `out` instead of returning it in memory: a document with gigabytes of
 /// placed files needs no second copy in RAM (recovery snapshots, large saves).
 pub fn write<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>) -> Result<(), FormatError> {
@@ -84,7 +93,7 @@ pub fn write<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Opt
 
 /// What a save does with placed files that are linked to a file on disk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Placed {
+pub enum Placed<'a> {
     /// Every placed file goes into the package, byte for byte: a self-contained document.
     #[default]
     Embed,
@@ -92,10 +101,14 @@ pub enum Placed {
     /// user's disk (crash recovery), where re-reading a link is what opening the document does.
     /// Files pasted into the document are still embedded — nothing else holds them.
     LinksOnly,
+    /// [`Placed::LinksOnly`], except that these assets keep their bytes: their file no longer
+    /// reproduces them (it moved, or is another size), so leaving them out would open a
+    /// document that is not the one the user saw.
+    LinksOnlyExcept(&'a [AssetId]),
 }
 
 /// [`write`], choosing what happens to linked placed files.
-pub fn write_with<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>, placed: Placed) -> Result<(), FormatError> {
+pub fn write_with<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>, placed: Placed<'_>) -> Result<(), FormatError> {
     write_with_large_entries_from(out, doc, preview, placed, LARGE_ENTRY)
 }
 
@@ -128,9 +141,16 @@ fn write_with_large_entries_from<W: Write + std::io::Seek>(
     out: &mut W,
     doc: &Document,
     preview: Option<&[u8]>,
-    placed: Placed,
+    placed: Placed<'_>,
     large_entry: usize,
 ) -> Result<(), FormatError> {
+    // The linked assets this save still writes: the ones whose link no longer holds their bytes.
+    let keep: &[AssetId] = match placed {
+        Placed::LinksOnlyExcept(keep) => keep,
+        Placed::Embed | Placed::LinksOnly => &[],
+    };
+    // Whether a linked file is left out at all (recovery data, not a copy of the user's disk).
+    let links_left_out = !matches!(placed, Placed::Embed);
     // JSON writes infinity and NaN as null, which no load accepts: the file would not open.
     if let Some(id) = doc.non_finite_item() {
         return Err(FormatError::Unsaveable(format!("object {} has a position or size that is not a finite number", id.0)));
@@ -157,7 +177,7 @@ fn write_with_large_entries_from<W: Write + std::io::Seek>(
         let json = serde_json::to_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
         z.write_all(&json).map_err(|e| FormatError::Io(e.to_string()))?;
         for (id, a) in &doc.assets {
-            if a.data.is_empty() || (placed == Placed::LinksOnly && a.link.is_some()) {
+            if a.data.is_empty() || (links_left_out && a.link.is_some() && !keep.contains(id)) {
                 continue;
             }
             // Already-compressed images are stored as-is.
@@ -203,6 +223,9 @@ const ZIP_MAGIC: [u8; 2] = *b"PK";
 /// isn't one reads all of it (a 31 MB `.indd` in the recent files took the start screen's frame
 /// with it), and no such file can hold a preview.
 pub fn read_preview<R: Read + std::io::Seek>(mut file: R) -> Option<Vec<u8>> {
+    // From the start of the file, whatever the caller's cursor is: a package just written to the
+    // same buffer is read from its beginning, not from its end. The archive reader needs 0 too.
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut magic = [0u8; ZIP_MAGIC.len()];
     file.read_exact(&mut magic).ok()?;
     file.seek(std::io::SeekFrom::Start(0)).ok()?;

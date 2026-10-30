@@ -393,6 +393,16 @@ fn the_skip_list_is_an_argument() {
     assert_eq!(skip_arg("layout.designcraft"), None);
 }
 
+/// The retry after a start that found no adapter at all forgets the recorded backend failures but
+/// keeps the adapters earlier restarts left out: they were hung, and the retry must not pick one
+/// again only to wait for it once more.
+#[test]
+fn the_no_adapter_retry_keeps_the_adapters_earlier_restarts_left_out() {
+    let skip = vec!["Dx12:10de:2204".to_string(), "Dx12".to_string(), SOFTWARE_LEFT.to_string(), "Gl".to_string(), "Vulkan:1002:164e".into()];
+    assert_eq!(retry_skip(&skip), ["Dx12:10de:2204", "Vulkan:1002:164e", RETRIED]);
+    assert_eq!(retry_skip(&[]), [RETRIED]);
+}
+
 #[test]
 fn a_restart_tries_the_next_adapter() {
     let c = wayland_desktop();

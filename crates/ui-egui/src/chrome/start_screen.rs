@@ -190,7 +190,9 @@ impl RecentStat {
     /// Nothing read yet: not known to be gone (so the card isn't dimmed before the answer), and
     /// old enough that the first look asks for a read.
     fn unread() -> RecentStat {
-        RecentStat { exists: true, modified: None, checked: 0.0, image: None }
+        // Checked long ago, not at 0: the clock counts from this process's first look, so 0.0
+        // would read as "just checked" for the first seconds and leave the cards unread.
+        RecentStat { exists: true, modified: None, checked: f64::NEG_INFINITY, image: None }
     }
 }
 

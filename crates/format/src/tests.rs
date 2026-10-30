@@ -529,6 +529,35 @@ fn the_preview_is_read_back_without_the_document() {
     assert_eq!(read_preview(Cursor::new(Vec::new())), None);
 }
 
+/// A package just written to a buffer is read from its beginning, whatever the caller's cursor
+/// is: the preview reader must not depend on it.
+#[test]
+fn the_preview_is_read_back_from_the_start_whatever_the_cursor_is() {
+    // A caller may hand over a buffer a package was just written to: its cursor is at the end.
+    let d = Document::new(&NewDocument::default());
+    let png = b"\x89PNG fake".to_vec();
+    let mut cursor = Cursor::new(save_with_preview(&d, Some(&png)).unwrap());
+    use std::io::Seek as _;
+    assert_eq!(cursor.seek(std::io::SeekFrom::End(0)).unwrap(), cursor.get_ref().len() as u64);
+    assert_eq!(read_preview(cursor), Some(png));
+}
+
+#[test]
+fn a_linked_file_the_file_no_longer_matches_keeps_its_bytes() {
+    // Recovery data leaves linked files out (it is not a copy of the user's Links folder), but a
+    // link that no longer reproduces the placed bytes must not replace them after a crash.
+    let mut d = Document::new(&NewDocument::default());
+    let a = png_asset(&mut d, b"placed bytes");
+    place(&mut d, a, 0.0);
+    std::sync::Arc::make_mut(d.assets.get_mut(&a).unwrap()).link = Some("/elsewhere/photo.png".into());
+    assert_eq!(asset_entries(&save_links_only(&d).unwrap()), 0, "a matching link stays a link");
+    let kept = save_links_only_except(&d, &[a]).unwrap();
+    assert_eq!(asset_entries(&kept), 1, "the bytes the file no longer holds stay");
+    let back = load(&kept).unwrap();
+    assert_eq!(&*back.assets[&a].data, b"placed bytes");
+    assert_eq!(back.assets[&a].link.as_deref(), Some("/elsewhere/photo.png"), "the link is still there");
+}
+
 /// A file that isn't a zip is refused after its first bytes: finding a directory in a file that
 /// has none reads all of it, and the recent files hold whatever the user opened last (a 31 MB
 /// `.indd` cost the start screen's frame a minute on a slow disk).

@@ -218,7 +218,15 @@ mod worker {
                     let mut r = designcraft_render::Renderer::new();
                     r.threads = 0;
                     while let Ok(job) = job_rx.recv() {
-                        if result_tx.send((job.key, draw(&mut r, &job.doc, &job.cache, job.of, job.px))).is_err() {
+                        // A panic on one row must not end this thread: its slot would never be
+                        // freed, and after four the panel would draw no thumbnail at all again.
+                        let (drawn, panicked) = contained(|| draw(&mut r, &job.doc, &job.cache, job.of, job.px));
+                        if panicked {
+                            // Its caches may be inconsistent after a panic: start clean.
+                            r = designcraft_render::Renderer::new();
+                            r.threads = 0;
+                        }
+                        if result_tx.send((job.key, drawn)).is_err() {
                             break;
                         }
                         ctx.request_repaint();
@@ -240,6 +248,15 @@ mod worker {
         };
         if let Err(e) = w.jobs.send(job) {
             ended(e.0.key);
+        }
+    }
+
+    /// A draw that panics (a renderer bug on one document) is contained: the row is left undrawn
+    /// with `None`, which frees its slot, and the worker draws the next one.
+    pub(super) fn contained<T>(draw: impl FnOnce() -> Option<T>) -> (Option<T>, bool) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(draw)) {
+            Ok(drawn) => (drawn, false),
+            Err(_) => (None, true),
         }
     }
 
