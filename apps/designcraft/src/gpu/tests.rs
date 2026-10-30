@@ -556,6 +556,8 @@ fn a_normal_exit_or_another_failure_does_not_restart() {
     let startup = Startup::new(None, Vec::new());
     assert_eq!(finish(Ok(Ok(())), &startup), Ok(()));
     // No adapter was picked (none can show the window): the error is returned, nothing restarts.
+    // Without a record nothing is blamed either, so there is nothing to forget and start over for.
+    assert!(!startup.blamed_a_backend());
     let none = eframe::Error::Wgpu(eframe::egui_wgpu::WgpuError::CustomNativeAdapterSelectionError("no graphics adapter can show the window".into()));
     assert_eq!(
         finish(Ok(Err(none)), &startup),

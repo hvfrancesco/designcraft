@@ -62,6 +62,10 @@ const SOFTWARE_LEFT: &str = "software-left";
 /// In a skip list: no hardware adapter could show the window, so software renderers may draw it.
 const SOFTWARE: &str = "software";
 
+/// In a skip list: the record's backend failures were forgotten once for a start that found no
+/// adapter at all, so it isn't done again (see [`finish`]).
+const RETRIED: &str = "retried";
+
 /// wgpu's variable for choosing an adapter by (part of) its name, any case.
 const NAME_ENV: &str = "WGPU_ADAPTER_NAME";
 
@@ -408,6 +412,20 @@ impl Startup {
         self.with_fallback(|f| f.finished());
     }
 
+    /// The start's backend couldn't find an adapter that can show the window: forget what the
+    /// record blamed, so the next start tries every backend again ([`backend::Fallback::forget`]).
+    pub fn forget_failures(&self) {
+        self.with_fallback(|f| f.forget());
+    }
+
+    /// Whether the record blamed a backend before this start: it moved away from one that never
+    /// showed a frame, or left one out that failed earlier. Such a blame is only proven by the
+    /// process dying at the driver, so a start that finds no adapter at all must not trust it
+    /// ([`finish`]).
+    fn blamed_a_backend(&self) -> bool {
+        self.with_fallback(|f| f.blamed_a_backend()).unwrap_or(false)
+    }
+
     /// Clear the record of the backend being tried before starting again (the failure was caught),
     /// returning it for [`Startup::retry`].
     fn caught(&self) -> Option<backend::Backend> {
@@ -692,6 +710,16 @@ pub fn finish(outcome: Result<eframe::Result, String>, startup: &Startup) -> Res
         None
     };
     let Some((skip, what)) = next else {
+        // Nothing is left to try. When not even an adapter could be picked, the backend simply
+        // can't show a window here — which says nothing about the driver faults the record
+        // remembers. Without this, a start that was killed before its first frame (so the next
+        // one moved to a fallback backend that can't present on this machine) would leave the
+        // app unable to start at all. Forget the record and start over, once.
+        if graphics_failed && startup.adapter.get().is_none() && startup.blamed_a_backend() && !startup.skip.iter().any(|k| k == RETRIED) {
+            log::error!("the window failed ({why}): no graphics adapter could show it; forgetting the recorded failures and starting again");
+            startup.forget_failures();
+            return restart(&[RETRIED.to_string()], startup).map_err(|e| format!("{why}; starting again failed: {e}"));
+        }
         return Err(if graphics_failed { format!("{why} ({HELP})") } else { why });
     };
     log::error!("the window failed ({why}): starting again {what}");
