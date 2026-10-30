@@ -242,9 +242,10 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
   Automatic recovery writes on a background thread, streams to disk and keeps linked placed
   files as links, so an autosave of that catalogue is ~1 MB instead of 3.6 GB written on the
   interface thread. A link whose file no longer holds the placed bytes (moved, edited or deleted)
-  keeps its copy in the snapshot instead, and a snapshot that finishes after its document was
-  saved is dropped rather than offered back after a crash. The start screen reads the recent
-  files' state and first-page pictures on its
+  keeps its copy in the snapshot instead, and a snapshot still being written when its document is
+  saved, reverted or closed is cancelled before it is published, so a crash cannot offer back a
+  copy older than the saved file. The start screen reads the recent files' state and first-page
+  pictures on its
   own thread (2026-10-30), and so do the installed CJK/Indic interface fallback faces, so the first
   frame no longer waits for either: an interface-thread 174 MB of startup reads became 1.2 MB on the
   reporting machine, and a file that isn't a package costs two bytes instead of a whole-file scan.

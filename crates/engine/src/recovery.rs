@@ -477,6 +477,9 @@ pub(crate) fn discard_document(s: &mut Session, index: usize, default_dir: Optio
         if !s.docs.iter().enumerate().any(|(other_index, owner)| {
             other_index != index && owner.recovery_entries.iter().any(|(entry_dir, entry_uid)| *entry_uid == uid && same_directory(entry_dir, &dir))
         }) {
+            // A write of it still running must not publish its snapshot after this point.
+            #[cfg(not(target_arch = "wasm32"))]
+            worker::cancel(&dir, uid);
             discard(&dir, uid);
         }
     }
@@ -528,7 +531,8 @@ pub fn save(s: &Session, dir: &Path) -> Result<usize> {
             discard(dir, d.uid);
             continue;
         }
-        write_snapshot(&Snapshot::of(&access, dir, d))?;
+        // The caller asked for this write now: nothing has cancelled it.
+        write_snapshot(&Snapshot::of(&access, dir, d), || false)?;
         n += 1;
     }
     Ok(n)
@@ -552,7 +556,7 @@ pub(crate) fn save_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
         }
         let Some(document) = s.docs.get(index) else { continue };
         let entry = Snapshot::of(&access, dir, document);
-        write_snapshot(&entry)?;
+        write_snapshot(&entry, || false)?;
         // The primary is useful even if optional metadata failed next. Track it immediately.
         if let Some(document) = s.docs.get_mut(index)
             && !has_checkpoint(document, dir)
@@ -606,8 +610,10 @@ impl Snapshot {
     }
 }
 
-/// Publish a document's recovery entry before its optional metadata.
-fn write_snapshot(entry: &Snapshot) -> Result<()> {
+/// Publish a document's recovery entry before its optional metadata. `cancelled` says whether the
+/// document was saved, reverted or closed since the write started: its snapshot is then dropped
+/// instead of published, so a crash cannot offer back a copy older than the saved file.
+fn write_snapshot(entry: &Snapshot, cancelled: impl Fn() -> bool) -> Result<()> {
     let (doc, meta) = files(&entry.dir, entry.uid);
     // Links stay links: recovery data is not a copy of the user's disk, and a catalogue with
     // gigabytes of placed files otherwise writes them all again every few minutes (and leaves
@@ -615,10 +621,19 @@ fn write_snapshot(entry: &Snapshot) -> Result<()> {
     // the ones whose file no longer holds the placed bytes, which stay in the snapshot.
     let document = entry.path.as_deref().map(Path::new);
     let keep = links_that_need_bytes(&entry.doc, document);
-    publish_recovery_written(&doc, entry.own, |out| {
-        designcraft_format::write_with(out, &entry.doc, None, designcraft_format::Placed::LinksOnlyExcept(&keep))
-            .map_err(|e| EngineError::Other(e.to_string()))
-    })?;
+    let published = publish_recovery_written(
+        &doc,
+        entry.own,
+        |out| {
+            designcraft_format::write_with(out, &entry.doc, None, designcraft_format::Placed::LinksOnlyExcept(&keep))
+                .map_err(|e| EngineError::Other(e.to_string()))
+        },
+        &cancelled,
+    )?;
+    // Cancelled while writing: no snapshot and no metadata for it.
+    if !published {
+        return Ok(());
+    }
     // Written: in a folder that is not this run's own, the entry is now this run's to replace and
     // remove (Save and Close must clean up the snapshot they wrote).
     if !entry.own {
@@ -663,7 +678,7 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
                 None => {
                     // No thread: write this one here rather than lose the recovery data.
                     let entry = Snapshot::of(&access, dir, document);
-                    write_snapshot(&entry)?;
+                    write_snapshot(&entry, || false)?;
                     queued += 1;
                 }
             }
@@ -775,6 +790,9 @@ mod worker {
         pub(super) done: Mutex<Receiver<Done>>,
         /// Documents queued or being written: a second write of one still holds nothing newer.
         running: Mutex<BTreeSet<(PathBuf, u64)>>,
+        /// A document saved, reverted or closed while its write was queued or running: the
+        /// snapshot it is producing must not be published.
+        cancelled: Mutex<BTreeSet<(PathBuf, u64)>>,
     }
 
     static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
@@ -785,9 +803,30 @@ mod worker {
         }
 
         fn finish(&self, dir: &Path, uid: u64) {
+            let key = (dir.to_path_buf(), uid);
             if let Ok(mut running) = self.running.lock() {
-                running.remove(&(dir.to_path_buf(), uid));
+                running.remove(&key);
             }
+            if let Ok(mut cancelled) = self.cancelled.lock() {
+                cancelled.remove(&key);
+            }
+        }
+
+        /// Do not publish the snapshot being written for `dir`/`uid`: the document was saved,
+        /// reverted or closed. Only a write that is queued or running is marked, so the set stays
+        /// as small as the work in flight.
+        fn cancel(&self, dir: &Path, uid: u64) {
+            let key = (dir.to_path_buf(), uid);
+            if !self.running.lock().is_ok_and(|running| running.contains(&key)) {
+                return;
+            }
+            if let Ok(mut cancelled) = self.cancelled.lock() {
+                cancelled.insert(key);
+            }
+        }
+
+        fn cancelled(&self, dir: &Path, uid: u64) -> bool {
+            self.cancelled.lock().is_ok_and(|cancelled| cancelled.contains(&(dir.to_path_buf(), uid)))
         }
     }
 
@@ -813,7 +852,12 @@ mod worker {
                         }
                     }
                 });
-                spawned.ok().map(|_| Writer { jobs, done: Mutex::new(done_rx), running: Mutex::new(BTreeSet::new()) })
+                spawned.ok().map(|_| Writer {
+                    jobs,
+                    done: Mutex::new(done_rx),
+                    running: Mutex::new(BTreeSet::new()),
+                    cancelled: Mutex::new(BTreeSet::new()),
+                })
             })
             .as_ref()
     }
@@ -823,11 +867,23 @@ mod worker {
         WRITER.get().and_then(Option::as_ref)
     }
 
+    /// Do not publish the snapshot being written for `dir`/`uid` (see [`Writer::cancel`]).
+    pub(super) fn cancel(dir: &Path, uid: u64) {
+        if let Some(w) = started() {
+            w.cancel(dir, uid);
+        }
+    }
+
+    /// Whether that write is already marked as cancelled (see [`Writer::cancelled`]).
+    pub(super) fn cancelled(dir: &Path, uid: u64) -> bool {
+        started().is_some_and(|w| w.cancelled(dir, uid))
+    }
+
     /// Write one snapshot, turning a panic into its error: a panic that ended this thread would
     /// leave the document marked as running for ever (so it is never written again) and the
     /// interface asking for frames for ever. A safety net: a writer still must not panic.
     fn guarded_write(job: &Snapshot) -> Option<String> {
-        guarded(|| write_snapshot(job)).err().map(|e| e.to_string())
+        guarded(|| write_snapshot(job, || cancelled(&job.dir, job.uid))).err().map(|e| e.to_string())
     }
 
     /// [`guarded_write`]'s guard, for any write on this thread.
@@ -845,6 +901,10 @@ mod worker {
         let key = (entry.dir.clone(), entry.uid);
         if !running.insert(key.clone()) {
             return Some(false);
+        }
+        // A write is wanted again: whatever cancelled the last one does not apply to this one.
+        if let Ok(mut cancelled) = w.cancelled.lock() {
+            cancelled.remove(&key);
         }
         if w.jobs.send(entry).is_err() {
             running.remove(&key);
@@ -899,13 +959,21 @@ fn secure_recovery_dir(_dir: &Path) -> Result<bool> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn publish_recovery_file(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
-    publish_recovery_written(path, replace, |out| out.write_all(bytes).map_err(|e| EngineError::Other(format!("{}: {e}", path.display()))))
+    publish_recovery_written(path, replace, |out| out.write_all(bytes).map_err(|e| EngineError::Other(format!("{}: {e}", path.display()))), || false)
+        .map(|_| ())
 }
 
 /// [`publish_recovery_file`], with `write` filling the temporary file: a large document is written
-/// straight to disk instead of being built in memory first.
+/// straight to disk instead of being built in memory first. Returns whether it was published;
+/// `cancelled` is asked after the bytes are written and before the rename, so a document saved or
+/// closed meanwhile leaves nothing behind.
 #[cfg(not(target_arch = "wasm32"))]
-fn publish_recovery_written(path: &Path, replace: bool, write: impl FnOnce(&mut std::io::BufWriter<&mut std::fs::File>) -> Result<()>) -> Result<()> {
+fn publish_recovery_written(
+    path: &Path,
+    replace: bool,
+    write: impl FnOnce(&mut std::io::BufWriter<&mut std::fs::File>) -> Result<()>,
+    cancelled: impl Fn() -> bool,
+) -> Result<bool> {
     let Some(dir) = path.parent() else {
         return Err(EngineError::Other(format!("{} has no parent folder", path.display())));
     };
@@ -926,13 +994,18 @@ fn publish_recovery_written(path: &Path, replace: bool, write: impl FnOnce(&mut 
         out.flush().map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
     }
     tmp.as_file_mut().sync_all().map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    // Last moment: the document was saved, reverted or closed while the bytes were written. The
+    // temporary file is dropped, so nothing of the stale snapshot stays.
+    if cancelled() {
+        return Ok(false);
+    }
     // Validate the non-followed leaf again immediately before renaming the randomized temporary
     // file to its fixed sibling destination.
     validate_recovery_dir(dir)?;
     let published = if replace { tmp.persist(path) } else { tmp.persist_noclobber(path) };
     published.map_err(|e| EngineError::Other(format!("{}: {}", path.display(), e.error)))?;
     sync_recovery_dir(dir)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -995,7 +1068,8 @@ fn publish_recovery_written(
     _path: &Path,
     _replace: bool,
     _write: impl FnOnce(&mut std::io::BufWriter<&mut std::fs::File>) -> Result<()>,
-) -> Result<()> {
+    _cancelled: impl Fn() -> bool,
+) -> Result<bool> {
     Err(EngineError::Other("recovery files are unavailable on the web".into()))
 }
 

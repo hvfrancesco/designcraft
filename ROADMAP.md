@@ -14,9 +14,9 @@ DesignCraft aims at full Adobe InDesign parity — and to be better: faster, ope
 
 - **2026-10-30** · Recovery data keeps what the user saw: a linked file that was moved, edited or
   deleted after placement keeps its copy in the snapshot (and in the copy republished after
-  recovering), a snapshot that finishes after its document was saved is dropped instead of being
-  offered back after a crash, and the recovery writer and the Pages thumbnail worker contain a
-  panic instead of stopping for good. No readiness percentage change.
+  recovering), a snapshot still being written when its document is saved, reverted or closed is
+  cancelled before it is published, and the recovery writer and the Pages thumbnail worker contain
+  a panic instead of stopping for good. No readiness percentage change.
 - **2026-10-30** · The first frame no longer waits for the disk: the start screen reads the recent
   files' state and first-page pictures on a `recent-files` thread, and the installed CJK/Indic
   interface fallback faces on a `ui-fonts` thread, so the window draws at once and the pictures and

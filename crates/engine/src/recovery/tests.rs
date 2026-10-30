@@ -251,7 +251,7 @@ fn a_snapshot_that_finishes_after_the_save_is_dropped() {
     s.execute("file.saveAs", &json!({"path": saved.to_string_lossy()})).unwrap();
     assert!(!s.docs[0].is_dirty());
     // The write lands after the save.
-    write_snapshot(&entry).unwrap();
+    write_snapshot(&entry, || false).unwrap();
     let (file, _) = files(dir.path(), uid);
     assert!(file.exists());
     assert!(!record_checkpoint(&mut s, dir.path().to_path_buf(), uid), "a saved document records no checkpoint");
@@ -260,9 +260,36 @@ fn a_snapshot_that_finishes_after_the_save_is_dropped() {
     // A document still unsaved does record one.
     s.execute("frame.create", &json!({"rect": [10, 10, 50, 50]})).unwrap();
     let entry = Snapshot::of(&prepare_save(&s, dir.path()).unwrap(), dir.path(), &s.docs[0]);
-    write_snapshot(&entry).unwrap();
+    write_snapshot(&entry, || false).unwrap();
     assert!(record_checkpoint(&mut s, dir.path().to_path_buf(), uid));
     assert!(s.docs[0].recovery_entries.iter().any(|(d, u)| *u == uid && d == dir.path()));
+}
+
+#[test]
+fn a_write_cancelled_midway_publishes_nothing() {
+    // Save/Revert/Close during a write marks it cancelled; the snapshot must not land after it,
+    // even if the app crashes before the next interface frame discards it.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dirty_session();
+    let entry = Snapshot::of(&prepare_save(&s, dir.path()).unwrap(), dir.path(), &s.docs[0]);
+    write_snapshot(&entry, || true).unwrap();
+    assert!(list(dir.path()).is_empty(), "a cancelled write leaves no snapshot");
+    assert!(!files(dir.path(), entry.uid).0.exists(), "nor its document");
+    assert!(!files(dir.path(), entry.uid).1.exists(), "nor its metadata");
+    // The temporary file it was written to is dropped, not left behind.
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().all(|e| e.is_ok_and(|e| !e.file_name().to_string_lossy().starts_with(".designcraft-recovery-"))),
+        "no temporary file is left"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn only_a_queued_write_is_cancelled() {
+    // A mark for a document with no write in flight would stay in the writer's set for ever.
+    let dir = tempfile::tempdir().unwrap();
+    worker::cancel(dir.path(), 7);
+    assert!(!worker::cancelled(dir.path(), 7), "nothing was queued for it");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
