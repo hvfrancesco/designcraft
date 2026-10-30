@@ -81,7 +81,7 @@ fn draw(
             let view = designcraft_geom::Affine::scale(scale) * designcraft_geom::Affine::translate(-b.origin().to_vec2());
             let o = RenderOptions { background: Some([255, 255, 255, 255]), ..opts };
             let placed = [designcraft_render::Placed { spread: SpreadRef::Parent(i), xf: designcraft_geom::Affine::IDENTITY }];
-            Some((r.render(doc, cache, &placed, w, h, view, &o), format!("thumbp{}", id.0)))
+            (r.render(&st.doc, &app.session.cache, &placed, (w, h), view, &o), format!("thumbp{}", id.0))
         }
     }
 }
