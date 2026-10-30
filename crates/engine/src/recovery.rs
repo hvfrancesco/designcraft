@@ -716,7 +716,7 @@ mod worker {
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
 
-    use super::*;
+    use super::{Path, PathBuf, Snapshot, write_snapshot};
 
     /// One document written, for the interface thread to record.
     pub(super) struct Done {
@@ -765,7 +765,7 @@ mod worker {
                         }
                     }
                 });
-                spawned.ok().and_then(|_| Some(Writer { jobs, done: Mutex::new(done_rx), running: Mutex::new(BTreeSet::new()) }))
+                spawned.ok().map(|_| Writer { jobs, done: Mutex::new(done_rx), running: Mutex::new(BTreeSet::new()) })
             })
             .as_ref()
     }
