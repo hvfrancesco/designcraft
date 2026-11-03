@@ -66,6 +66,44 @@ pub fn save_with_preview(doc: &Document, preview: Option<&[u8]>) -> Result<Vec<u
     save_with_large_entries_from(doc, preview, LARGE_ENTRY)
 }
 
+/// [`save`], leaving out the placed files that are linked to a file on disk (see
+/// [`Placed::LinksOnly`]): the package holds their paths, and opening it reads them again.
+pub fn save_links_only(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    let mut buf = Cursor::new(Vec::new());
+    write_with(&mut buf, doc, None, Placed::LinksOnly)?;
+    Ok(buf.into_inner())
+}
+
+/// [`save_links_only`], keeping the bytes of the linked assets in `keep` (see
+/// [`Placed::LinksOnlyExcept`]): a link whose file no longer reproduces its placed bytes must not
+/// replace them when the package is opened.
+pub fn save_links_only_except(doc: &Document, keep: &[AssetId]) -> Result<Vec<u8>, FormatError> {
+    let mut buf = Cursor::new(Vec::new());
+    write_with(&mut buf, doc, None, Placed::LinksOnlyExcept(keep))?;
+    Ok(buf.into_inner())
+}
+
+/// What a save does with placed files that are linked to a file on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placed<'a> {
+    /// Every placed file goes into the package, byte for byte: a self-contained document.
+    #[default]
+    Embed,
+    /// Linked files are left out and only their paths stay: for data that is not a copy of the
+    /// user's disk (crash recovery), where re-reading a link is what opening the document does.
+    /// Files pasted into the document are still embedded — nothing else holds them.
+    LinksOnly,
+    /// [`Placed::LinksOnly`], except that these assets keep their bytes: their file no longer
+    /// reproduces them (it moved, or is another size), so leaving them out would open a
+    /// document that is not the one the user saw.
+    LinksOnlyExcept(&'a [AssetId]),
+}
+
+/// [`write`], choosing what happens to linked placed files.
+pub fn write_with<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>, placed: Placed<'_>) -> Result<(), FormatError> {
+    write_with_large_entries_from(out, doc, preview, placed, LARGE_ENTRY)
+}
+
 /// Asset entries this size or larger are written with zip64 sizes. Zip rejects an entry over
 /// 4 GiB written without them; the margin covers deflate output that is larger than its input.
 const LARGE_ENTRY: usize = (u32::MAX as usize).saturating_sub(64 << 20);
@@ -87,22 +125,30 @@ fn required_version(doc: &Document) -> u32 {
 
 fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_entry: usize) -> Result<Vec<u8>, FormatError> {
     let mut buf = Cursor::new(Vec::new());
-    write_with_large_entries_from(&mut buf, doc, preview, large_entry)?;
+    write_with_large_entries_from(&mut buf, doc, preview, Placed::Embed, large_entry)?;
     Ok(buf.into_inner())
 }
 
 /// Write the package to `out` instead of returning it in memory: a document with gigabytes of
 /// placed files needs no second copy in RAM (recovery snapshots, large saves).
 pub fn write<W: Write + std::io::Seek>(out: &mut W, doc: &Document, preview: Option<&[u8]>) -> Result<(), FormatError> {
-    write_with_large_entries_from(out, doc, preview, LARGE_ENTRY)
+    write_with(out, doc, preview, Placed::Embed)
 }
 
 fn write_with_large_entries_from<W: Write + std::io::Seek>(
     out: &mut W,
     doc: &Document,
     preview: Option<&[u8]>,
+    placed: Placed<'_>,
     large_entry: usize,
 ) -> Result<(), FormatError> {
+    // The linked assets this save still writes: the ones whose link no longer holds their bytes.
+    let keep: &[AssetId] = match placed {
+        Placed::LinksOnlyExcept(keep) => keep,
+        Placed::Embed | Placed::LinksOnly => &[],
+    };
+    // Whether a linked file is left out at all (recovery data, not a copy of the user's disk).
+    let links_left_out = !matches!(placed, Placed::Embed);
     // JSON writes infinity and NaN as null, which no load accepts: the file would not open.
     if let Some(id) = doc.non_finite_item() {
         return Err(FormatError::Unsaveable(format!("object {} has a position or size that is not a finite number", id.0)));
@@ -129,7 +175,7 @@ fn write_with_large_entries_from<W: Write + std::io::Seek>(
         let json = serde_json::to_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
         z.write_all(&json).map_err(|e| FormatError::Io(e.to_string()))?;
         for (id, a) in &doc.assets {
-            if a.data.is_empty() {
+            if a.data.is_empty() || (links_left_out && a.link.is_some() && !keep.contains(id)) {
                 continue;
             }
             // Already-compressed images are stored as-is.

@@ -13,6 +13,10 @@
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
 - **2026-10-30** · Document Fonts lookup treats a bare document filename's empty parent as the current directory (#2014), preserving case-insensitive discovery and automation read-root checks. No readiness percentage change.
+- **2026-10-30** · Recovery data keeps what the user saw: a linked file that was moved, edited or
+  deleted after placement keeps its copy in the snapshot (and in the copy republished after
+  recovering), while unchanged links stay links instead of copying a Links folder into every
+  snapshot. No readiness percentage change.
 - **2026-10-27** · Automatic recovery writes off the interface thread, straight to disk: on a
   190-page catalogue with 4.2 GB of placed files an autosave was 3.6 GB deflated in RAM on the
   interface thread, which stopped the window answering for 30-100 s after an edit. It is now a

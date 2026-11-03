@@ -631,10 +631,19 @@ struct Written {
 /// instead of published, so a crash cannot offer back a copy older than the saved file.
 fn write_snapshot(entry: &Snapshot, cancelled: impl Fn() -> bool) -> Written {
     let (doc, meta) = files(&entry.dir, entry.uid);
+    // Links stay links: recovery data is not a copy of the user's disk, and a catalogue with
+    // gigabytes of placed files otherwise writes them all again every few minutes (and leaves
+    // them behind after a crash). Recovery re-reads them, as opening the document does — except
+    // the ones whose file no longer holds the placed bytes, which stay in the snapshot.
+    let document = entry.path.as_deref().map(Path::new);
+    let keep = links_that_need_bytes(&entry.doc, document);
     let published = publish_recovery_written(
         &doc,
         entry.own,
-        |out| designcraft_format::write(out, &entry.doc, None).map_err(|e| EngineError::Other(e.to_string())),
+        |out| {
+            designcraft_format::write_with(out, &entry.doc, None, designcraft_format::Placed::LinksOnlyExcept(&keep))
+                .map_err(|e| EngineError::Other(e.to_string()))
+        },
         &cancelled,
     );
     match published {
@@ -699,6 +708,30 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
         }
         Ok(queued)
     }
+}
+
+/// The linked assets a recovery snapshot must keep the bytes of: those whose file no longer
+/// reproduces them (gone, or another size). Metadata only: re-reading every link would cost what
+/// leaving them out saves, and opening the snapshot reads the unchanged ones anyway. A file
+/// edited in place to the same size is still taken from the disk, as opening the document takes it.
+fn links_that_need_bytes(doc: &designcraft_doc::Document, document: Option<&Path>) -> Vec<designcraft_doc::AssetId> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (doc, document);
+        Vec::new()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        doc.assets.values().filter(|a| !a.data.is_empty() && a.link.is_some()).filter(|a| !link_reproduces(a, document)).map(|a| a.id).collect()
+    }
+}
+
+/// Whether the file `a` is linked to still holds the bytes placed into the document.
+#[cfg(not(target_arch = "wasm32"))]
+fn link_reproduces(a: &designcraft_doc::Asset, document: Option<&Path>) -> bool {
+    let Some(link) = a.link.as_deref() else { return true };
+    let Ok(path) = crate::io::document_path(link, document) else { return false };
+    crate::io::metadata(path).is_ok_and(|m| m.is_file() && u64::try_from(a.data.len()).is_ok_and(|n| m.len() == n))
 }
 
 /// Apply one finished background write: record the checkpoint of a document still open and
@@ -1132,6 +1165,22 @@ pub fn list(dir: &Path) -> Vec<(u64, Value)> {
     out
 }
 
+/// Read back the placed files a recovery snapshot left out because they are linked, as opening
+/// the document does. A link whose file is gone or changed kept its bytes in the snapshot (see
+/// [`links_that_need_bytes`]), so what the user saw survives the crash; an unchanged one is read
+/// here, as opening the document reads it.
+#[cfg(not(target_arch = "wasm32"))]
+fn reload_links(d: &mut designcraft_doc::Document, document: Option<&Path>) {
+    for a in d.assets.values_mut() {
+        if !a.data.is_empty() {
+            continue;
+        }
+        let Some(link) = a.link.clone() else { continue };
+        let Some((_, bytes)) = crate::cmd::interchange::read_packaged_link(&link, document) else { continue };
+        std::sync::Arc::make_mut(a).data = std::sync::Arc::new(bytes);
+    }
+}
+
 /// Reopen recovery entries as unsaved documents. Publish each recovered document under its new
 /// uid before removing the original, so another crash before the next timer preserves the edits.
 /// Entries belonging to documents already open in this session's recovery folder are left alone.
@@ -1176,6 +1225,9 @@ fn open_with_publisher(s: &mut Session, dir: &Path, mut publish: impl FnMut(&Pat
             Err(_) => continue,
         };
         let path = meta.get("path").and_then(Value::as_str).map(str::to_string);
+        // The snapshot left the linked files out; they are where the document says they are.
+        #[cfg(not(target_arch = "wasm32"))]
+        reload_links(&mut d, path.as_deref().map(Path::new));
         // Skipped font files are logged; the document opens without them.
         let fonts = path.as_deref().and_then(|p| crate::cmd::load_document_fonts(&mut d, p).0);
         let mut st = DocState::new(d, path);
@@ -1194,7 +1246,10 @@ fn open_with_publisher(s: &mut Session, dir: &Path, mut publish: impl FnMut(&Pat
         // clean up every snapshot this document actually owns rather than an unrelated same uid.
         if let Some(state) = s.docs.get_mut(index) {
             let (document, metadata) = files(&destination, state.uid);
-            let published = designcraft_format::save(state.doc.as_ref())
+            // Still recovery data: the republished copy keeps links as links too, except the ones
+            // whose file no longer holds their bytes, which must survive the republish.
+            let keep = links_that_need_bytes(state.doc.as_ref(), state.path.as_deref().map(Path::new));
+            let published = designcraft_format::save_links_only_except(state.doc.as_ref(), &keep)
                 .map_err(|e| EngineError::Other(e.to_string()))
                 .and_then(|bytes| publish(&document, &bytes));
             match published {
