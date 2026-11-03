@@ -517,6 +517,22 @@ fn writing_to_a_stream_makes_the_same_file_as_saving_in_memory() {
 }
 
 #[test]
+fn a_linked_file_the_file_no_longer_matches_keeps_its_bytes() {
+    // Recovery data leaves linked files out (it is not a copy of the user's Links folder), but a
+    // link that no longer reproduces the placed bytes must not replace them after a crash.
+    let mut d = Document::new(&NewDocument::default());
+    let a = png_asset(&mut d, b"placed bytes");
+    place(&mut d, a, 0.0);
+    std::sync::Arc::make_mut(d.assets.get_mut(&a).unwrap()).link = Some("/elsewhere/photo.png".into());
+    assert_eq!(asset_entries(&save_links_only(&d).unwrap()), 0, "a matching link stays a link");
+    let kept = save_links_only_except(&d, &[a]).unwrap();
+    assert_eq!(asset_entries(&kept), 1, "the bytes the file no longer holds stay");
+    let back = load(&kept).unwrap();
+    assert_eq!(&*back.assets[&a].data, b"placed bytes");
+    assert_eq!(back.assets[&a].link.as_deref(), Some("/elsewhere/photo.png"), "the link is still there");
+}
+
+#[test]
 fn the_preview_is_read_back_without_the_document() {
     let d = Document::new(&NewDocument::default());
     let png = b"\x89PNG fake".to_vec();

@@ -171,6 +171,82 @@ fn a_background_save_writes_recovery_data_the_app_can_recover() {
     discard(dir.path(), reopened.doc().unwrap().uid);
 }
 
+/// A placed file linked to disk, as a catalogues with a Links folder has them.
+fn session_with_linked_image(dir: &Path) -> (Session, std::path::PathBuf) {
+    let image = dir.join("photo.png");
+    let png = designcraft_render::Rendered { width: 8, height: 8, pixels: vec![90u8; 8 * 8 * 4] }.to_png();
+    std::fs::write(&image, &png).unwrap();
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    s.execute("file.place", &json!({"path": image.to_string_lossy()})).unwrap();
+    assert!(s.doc().unwrap().doc.assets.values().any(|a| a.link.is_some()), "the file is placed as a link");
+    (s, image)
+}
+
+#[test]
+fn recovery_data_keeps_a_linked_file_as_a_link() {
+    // Embedding the linked file made a recovery snapshot as large as the user's Links folder,
+    // and left those gigabytes behind after every crash.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, image) = session_with_linked_image(dir.path());
+    let entry = dir.path().join(format!("{}.designcraft", s.docs[0].uid));
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    let bytes = std::fs::read(&entry).unwrap();
+    let packaged = designcraft_format::load(&bytes).unwrap();
+    assert!(packaged.assets.values().all(|a| a.data.is_empty()), "the snapshot carries no copy of the link");
+    assert!(packaged.assets.values().all(|a| a.link.is_some()), "it keeps where the file is");
+    // Recovering reads it back: the document opens as it did.
+    let mut reopened = Session::new();
+    assert_eq!(open(&mut reopened, dir.path()).unwrap().len(), 1);
+    let a = reopened.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(a.link.as_deref(), Some(image.to_string_lossy().as_ref()));
+    assert_eq!(&*a.data, &std::fs::read(&image).unwrap());
+    discard(dir.path(), reopened.doc().unwrap().uid);
+}
+
+/// The placed bytes of the linked image in `dir`.
+fn placed_bytes(s: &Session) -> Vec<u8> {
+    s.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link").data.to_vec()
+}
+
+#[test]
+fn a_link_whose_file_changed_or_is_gone_keeps_its_bytes() {
+    // A snapshot leaves a link out only while the file still holds the placed bytes: a file that
+    // was moved, edited or deleted after placement must not replace what the user saw.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, image) = session_with_linked_image(dir.path());
+    let placed = placed_bytes(&s);
+    let entry = dir.path().join(format!("{}.designcraft", s.docs[0].uid));
+
+    // Edited in place, to another size.
+    std::fs::write(&image, b"not the placed bytes any more").unwrap();
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    let packaged = designcraft_format::load(&std::fs::read(&entry).unwrap()).unwrap();
+    let a = packaged.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(placed, a.data.to_vec(), "the bytes the file no longer holds stay in the snapshot");
+    assert_eq!(a.link.as_deref(), Some(image.to_string_lossy().as_ref()), "and so does the link");
+    let mut recovered = Session::new();
+    assert_eq!(open(&mut recovered, dir.path()).unwrap().len(), 1);
+    let a = recovered.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(placed, a.data.to_vec(), "recovered as the user saw it, not as the edited file is");
+    // The republished entry (a crash before the next timer) keeps them too.
+    let (uid, _) = list(dir.path()).into_iter().next().expect("the recovered entry");
+    let republished = designcraft_format::load(&std::fs::read(files(dir.path(), uid).0).unwrap()).unwrap();
+    assert!(republished.assets.values().any(|a| !a.data.is_empty()), "the republished snapshot keeps them");
+    discard(dir.path(), recovered.doc().unwrap().uid);
+
+    // Gone after the crash: the bytes stay, and the link reports missing, as opening would.
+    std::fs::remove_file(&image).unwrap();
+    assert_eq!(save(&s, dir.path()).unwrap(), 1);
+    let mut recovered = Session::new();
+    assert_eq!(open(&mut recovered, dir.path()).unwrap().len(), 1);
+    let a = recovered.doc().unwrap().doc.assets.values().find(|a| a.link.is_some()).expect("the link");
+    assert_eq!(placed, a.data.to_vec());
+    let links = recovered.execute("links.list", &json!({})).unwrap();
+    assert_eq!(links[0]["status"], "missing", "the file is still reported missing, as opening reports it");
+    discard(dir.path(), recovered.doc().unwrap().uid);
+}
+
 #[test]
 fn a_snapshot_that_finishes_after_the_save_is_dropped() {
     // A write of a large document runs for seconds: the user can save while it does. The saved
