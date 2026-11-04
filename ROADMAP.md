@@ -16,6 +16,10 @@ DesignCraft aims at full Adobe InDesign parity — and to be better: faster, ope
 - **2026-10-30** · A start that finds no graphics adapter at all no longer blames its backend: it
   forgets the recorded failures and starts over once, so a launch killed while the window was
   still starting cannot leave the app unable to start. No readiness percentage change.
+- **2026-10-27** · The Pages panel draws page and parent thumbnails on a background thread, only
+  for the rows on screen, and keeps the previous revision's picture until the new one arrives. On
+  a 190-page catalogue switching to the Pages tab went from 43 s to 0.2 s, and editing no longer
+  froze the window for over a minute. No readiness percentage change.
 - **2026-10-28** · Inline table rows leave room for column and spanning footnotes, continuing in
   the next column or frame when needed (#1901). Cell-local footnotes contribute to row height
   and sit inside the cell rather than outside its measuring frame. Vertical justification keeps
