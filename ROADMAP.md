@@ -424,6 +424,12 @@ Newest first.
   for the rows on screen, and keeps the previous revision's picture until the new one arrives. On
   a 190-page catalogue switching to the Pages tab went from 43 s to 0.2 s, and editing no longer
   froze the window for over a minute. No readiness percentage change.
+- **2026-10-27** · Automatic recovery writes off the interface thread, straight to disk: on a
+  190-page catalogue with 4.2 GB of placed files an autosave was 3.6 GB deflated in RAM on the
+  interface thread, which stopped the window answering for 30-100 s after an edit. It is now a
+  background write (`file.recovery.save {background}`, `file.recovery.progress`), the caller
+  blocked for 109 ms instead, and Save, Close and Revert cancel a snapshot still being written.
+  No readiness percentage change.
 - **2026-10-27** · An iconic panel's flyout stays open while you work in the canvas or a text field: Auto-Collapse Iconic Panels is off by default, and preferences saved with it on start with it off. Preferences › Interface › Panels holds the setting next to the column bar's menu item. No readiness percentage change.
 - **2026-10-26** · Inner Shadow, Inner Glow (from the edges) and Bevel and Emboss on a frame holding an image follow what the image paints: a transparent part is outside the object, so the effect lines the image's opaque edge, not the frame (#1622). Satin and a centred Inner Glow still follow the frame. No readiness percentage change.
 - **2026-10-24** · Column rules run from the top line's ascent to the bottom line's descent, as InDesign draws them, instead of from the top to the bottom of the columns, on screen, in PDF and in PowerPoint export. The top and bottom insets shorten the rule from those lines. Existing documents draw their column rules at the new length. No readiness percentage change.
