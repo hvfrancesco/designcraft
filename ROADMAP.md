@@ -20,6 +20,10 @@ DesignCraft aims at full Adobe InDesign parity — and to be better: faster, ope
   `recent-files` thread, so the first frame draws at once and the pictures arrive afterwards. A
   file that isn't a package costs two bytes instead of being scanned whole (a 31 MB `.indd` in the
   recent files was read four times). No readiness percentage change.
+- **2026-10-30** · The installed CJK/Indic interface fallback faces are read on a `ui-fonts`
+  thread instead of the first frame: the window draws with the built-in faces at once, and the
+  existing retry installs the rest when they arrive (47 MB of font files on the reporting machine).
+  No readiness percentage change.
 - **2026-10-28** · Inline table rows leave room for column and spanning footnotes, continuing in
   the next column or frame when needed (#1901). Cell-local footnotes contribute to row height
   and sit inside the cell rather than outside its measuring frame. Vertical justification keeps
