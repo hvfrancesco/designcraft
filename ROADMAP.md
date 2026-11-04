@@ -16,10 +16,10 @@ DesignCraft aims at full Adobe InDesign parity — and to be better: faster, ope
 - **2026-10-30** · A start that finds no graphics adapter at all no longer blames its backend: it
   forgets the recorded failures and starts over once, so a launch killed while the window was
   still starting cannot leave the app unable to start. No readiness percentage change.
-- **2026-10-27** · The Pages panel draws page and parent thumbnails on a background thread, only
-  for the rows on screen, and keeps the previous revision's picture until the new one arrives. On
-  a 190-page catalogue switching to the Pages tab went from 43 s to 0.2 s, and editing no longer
-  froze the window for over a minute. No readiness percentage change.
+- **2026-10-30** · The start screen reads a recent file's state and saved first-page picture on a
+  `recent-files` thread, so the first frame draws at once and the pictures arrive afterwards. A
+  file that isn't a package costs two bytes instead of being scanned whole (a 31 MB `.indd` in the
+  recent files was read four times). No readiness percentage change.
 - **2026-10-28** · Inline table rows leave room for column and spanning footnotes, continuing in
   the next column or frame when needed (#1901). Cell-local footnotes contribute to row height
   and sit inside the cell rather than outside its measuring frame. Vertical justification keeps
@@ -420,6 +420,10 @@ Newest first.
 - **2026-10-28** · Discretionary hyphens (U+00AD) break in the single-line composer with automatic hyphenation on or off, matching the paragraph composer. Unbroken soft hyphens remain invisible and zero-width, and words containing them keep only their discretionary break points (#1955). No readiness percentage change.
 - **2026-10-28** · Autoflow no longer sizes the rest of a story by a frame that a Start Paragraph option (next column, frame, page, or odd or even page) ends early (#1209). With a title before a chapter that starts on the next odd page, it estimated a page per few characters, added up to 2000 pages (the autoflow limit) and removed them again: placing 2000 words took 36 s in the app, now 0.4 s, with the same pages. It looks past tracked-deleted paragraphs for the option, as composing does, and asks for every frame that start options and breaks force in one round: 200 one-line chapters on their own pages take 9 ms (58 ms before). A break and the start option it meets count once, and breaks that tracked changes delete or a hidden condition hides don't count. No readiness percentage change.
 - **2026-10-28** · IDML export writes the document's default `StoryPreference` in `Resources/Preferences.xml`, as InDesign does. Only each story carried one, and IDML readers that take the spread reading order from the document's (Okapi's IDML filter) failed on DesignCraft's files. No readiness percentage change.
+- **2026-10-27** · The Pages panel draws page and parent thumbnails on a background thread, only
+  for the rows on screen, and keeps the previous revision's picture until the new one arrives. On
+  a 190-page catalogue switching to the Pages tab went from 43 s to 0.2 s, and editing no longer
+  froze the window for over a minute. No readiness percentage change.
 - **2026-10-27** · An iconic panel's flyout stays open while you work in the canvas or a text field: Auto-Collapse Iconic Panels is off by default, and preferences saved with it on start with it off. Preferences › Interface › Panels holds the setting next to the column bar's menu item. No readiness percentage change.
 - **2026-10-26** · Inner Shadow, Inner Glow (from the edges) and Bevel and Emboss on a frame holding an image follow what the image paints: a transparent part is outside the object, so the effect lines the image's opaque edge, not the frame (#1622). Satin and a centred Inner Glow still follow the frame. No readiness percentage change.
 - **2026-10-24** · Column rules run from the top line's ascent to the bottom line's descent, as InDesign draws them, instead of from the top to the bottom of the columns, on screen, in PDF and in PowerPoint export. The top and bottom insets shorten the rule from those lines. Existing documents draw their column rules at the new length. No readiness percentage change.
